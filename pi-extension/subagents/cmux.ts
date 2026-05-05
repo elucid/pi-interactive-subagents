@@ -249,6 +249,7 @@ function createSurfaceInPane(name: string, pane: string): string {
   execSync(`cmux rename-tab --surface ${shellEscape(surface)} ${shellEscape(name)}`, {
     encoding: "utf8",
   });
+  wakeSurfaceForInput(surface);
   return surface;
 }
 
@@ -276,6 +277,7 @@ export function createSurfaceSplit(
     execSync(`cmux rename-tab --surface ${shellEscape(surface)} ${shellEscape(name)}`, {
       encoding: "utf8",
     });
+    wakeSurfaceForInput(surface);
     return surface;
   }
 
@@ -475,6 +477,45 @@ export function renameWorkspace(title: string): void {
 /**
  * Send a command string to a pane and execute it.
  */
+interface CmuxIdentity {
+  caller?: { workspace_ref?: string };
+  focused?: { workspace_ref?: string };
+}
+
+function isCmuxCallerWorkspaceHidden(): boolean {
+  try {
+    const info = JSON.parse(execSync("cmux identify", { encoding: "utf8" })) as CmuxIdentity;
+    const callerWorkspace = info.caller?.workspace_ref;
+    const focusedWorkspace = info.focused?.workspace_ref;
+    return !!callerWorkspace && !!focusedWorkspace && callerWorkspace !== focusedWorkspace;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Wake a freshly-created cmux surface before sending the real launch command.
+ *
+ * cmux lazily initializes terminal surfaces in workspaces that are not
+ * currently focused. If the first text sent to such a surface is the real
+ * command, cmux may render that text before shell startup and never evaluate
+ * it. A harmless newline forces initialization without changing focus; the
+ * existing shell-ready delay can then wait for the prompt normally.
+ */
+export function wakeSurfaceForInput(surface: string): boolean {
+  const backend = getMuxBackend();
+  if (backend !== "cmux" || !isCmuxCallerWorkspaceHidden()) return false;
+
+  try {
+    execSync(`cmux send --surface ${shellEscape(surface)} ${shellEscape("\n")}`, {
+      encoding: "utf8",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function sendCommand(surface: string, command: string): void {
   const backend = requireMuxBackend();
 
