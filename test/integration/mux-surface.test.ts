@@ -11,6 +11,7 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import {
   getAvailableBackends,
@@ -18,6 +19,7 @@ import {
   restoreBackend,
   createTestEnv,
   cleanupTestEnv,
+  createSurfaceSplit,
   createTrackedSurface,
   untrackSurface,
   sendCommand,
@@ -33,6 +35,24 @@ import {
   waitForScreen,
   type TestEnv,
 } from "./harness.ts";
+
+function cmuxIdentify(): {
+  caller: { workspace_ref: string; surface_ref: string };
+  focused: { workspace_ref: string; surface_ref: string };
+} {
+  return JSON.parse(execFileSync("cmux", ["identify"], { encoding: "utf8" }));
+}
+
+function cmuxWorkspaceRefs(): string[] {
+  return execFileSync("cmux", ["list-workspaces"], { encoding: "utf8" })
+    .split("\n")
+    .map((line) => line.match(/workspace:\d+/)?.[0])
+    .filter((workspace): workspace is string => !!workspace);
+}
+
+function cmuxSelectWorkspace(workspace: string): void {
+  execFileSync("cmux", ["select-workspace", "--workspace", workspace], { encoding: "utf8" });
+}
 
 const backends = getAvailableBackends();
 
@@ -115,6 +135,75 @@ for (const backend of backends) {
         screen.includes("_END"),
         `Expected full output (not truncated). Got:\n${screen.slice(-300)}`,
       );
+    });
+
+    it("executes long commands in hidden cmux workspaces without stealing focus", async (t) => {
+      if (backend !== "cmux") {
+        t.skip("cmux-specific lazy terminal initialization regression");
+        return;
+      }
+
+      const initial = cmuxIdentify();
+      const callerWorkspace = initial.caller.workspace_ref;
+      const originalFocusedWorkspace = initial.focused.workspace_ref;
+      const awayWorkspace = cmuxWorkspaceRefs().find((workspace) => workspace !== callerWorkspace);
+
+      if (!awayWorkspace) {
+        t.skip("requires at least two cmux workspaces");
+        return;
+      }
+
+      const shouldRestoreFocus = originalFocusedWorkspace === callerWorkspace;
+      if (shouldRestoreFocus) {
+        cmuxSelectWorkspace(awayWorkspace);
+        await sleep(500);
+      }
+
+      const hidden = cmuxIdentify();
+      assert.notEqual(
+        hidden.focused.workspace_ref,
+        callerWorkspace,
+        "test setup should leave the caller workspace hidden",
+      );
+
+      const surface = createSurfaceSplit("hidden-long-cmd-test", "right");
+      env.surfaces.push(surface);
+
+      try {
+        const marker = `HIDDEN_LONG_${uniqueId()}`;
+
+        // Match the subagent launch sequence: create a surface, wait for shell
+        // readiness, then send a script-backed command. Without the cmux wake
+        // workaround, hidden surfaces render the `bash <script>` text before
+        // shell startup and never evaluate it.
+        await sleep(2500);
+        sendLongCommand(surface, `echo ${marker}`);
+        await sleep(4000);
+
+        const screen = readScreen(surface, 100);
+        assert.ok(
+          screen.split("\n").some((line) => line.trim() === marker),
+          `Expected hidden cmux surface to execute script marker ${marker}. Got:\n${screen}`,
+        );
+
+        const after = cmuxIdentify();
+        assert.equal(
+          after.focused.workspace_ref,
+          hidden.focused.workspace_ref,
+          "hidden surface wake must not switch the visible cmux workspace",
+        );
+      } finally {
+        try {
+          closeSurface(surface);
+        } catch {}
+        untrackSurface(env, surface);
+
+        if (shouldRestoreFocus) {
+          try {
+            cmuxSelectWorkspace(originalFocusedWorkspace);
+          } catch {}
+        }
+      }
     });
 
     it("reads screen asynchronously", async () => {
